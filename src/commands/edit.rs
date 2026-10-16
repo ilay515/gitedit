@@ -2,14 +2,14 @@ use crate::cli::Cli;
 use crate::date_parser::parse_date;
 use crate::editor::{edit_manifest_with_retry, resolve_editor};
 use crate::errors::GiteditError;
-use crate::git::range::{format_short_sha, resolve_range};
+use crate::git::range::resolve_range;
 use crate::git::repo::RepoContext;
 use crate::git::rewrite::{execute_rewrite, RewritePlan};
-use crate::manifest::{format_manifest, has_manifest_changes};
 use crate::manifest::types::{CommitAction, ManifestEntry};
+use crate::manifest::{commit_to_entry, format_manifest, has_manifest_changes, parse_author_spec};
 use chrono::FixedOffset;
 use colored::Colorize;
-use regex::Regex;
+use git2::{Commit, Oid, Repository};
 
 pub struct EditArgs<'a> {
     pub commit_spec: &'a str,
@@ -21,19 +21,18 @@ pub struct EditArgs<'a> {
     pub open_editor: bool,
 }
 
-pub fn run(
-    cli: &Cli,
-    args: EditArgs,
-) -> Result<(), GiteditError> {
-    let ctx = RepoContext::open(".")?;
-
-    let target_commit = ctx.repo.revparse_single(args.commit_spec)?.peel_to_commit()?;
+/// Resolves commit chain starting at HEAD down to the specified target commit.
+pub fn resolve_target_ancestry_chain<'a>(
+    repo: &'a Repository,
+    commit_spec: &str,
+    limit: usize,
+) -> Result<Vec<Commit<'a>>, GiteditError> {
+    let target_commit = repo.revparse_single(commit_spec)?.peel_to_commit()?;
     let target_oid = target_commit.id();
 
-    // Range must include all commits from HEAD down to target_commit
-    let commits = resolve_range(&ctx.repo, None, None, 1000)?;
-    let mut found = false;
+    let commits = resolve_range(repo, None, None, limit)?;
     let mut relevant_commits = Vec::new();
+    let mut found = false;
 
     for c in commits {
         let is_target = c.id() == target_oid;
@@ -47,75 +46,87 @@ pub fn run(
     if !found {
         return Err(GiteditError::Other(format!(
             "Commit {} is not an ancestor of current branch tip",
-            args.commit_spec
+            commit_spec
         )));
     }
 
-    let mut entries = Vec::new();
-    let head_oid = ctx.head_oid;
-    let re = Regex::new(r"^(.*?)\s*<([^>]+)>$").unwrap();
+    Ok(relevant_commits)
+}
 
-    for c in &relevant_commits {
-        let oid = c.id();
-        let short_sha = format_short_sha(oid);
-        let c_auth = c.author();
-        let mut a_name = c_auth.name().unwrap_or("").to_string();
-        let mut a_email = c_auth.email().unwrap_or("").to_string();
-
-        let t = c.time();
-        let offset = FixedOffset::east_opt(t.offset_minutes() * 60).unwrap_or(FixedOffset::east_opt(0).unwrap());
-        let dt = chrono::DateTime::from_timestamp(t.seconds(), 0)
-            .map(|d| d.with_timezone(&offset))
-            .unwrap_or_default();
-        let mut date_raw = dt.format("%Y-%m-%d %H:%M:%S %:z").to_string();
-
-        let mut msg = c.message().unwrap_or("").to_string();
-
-        if oid == target_oid && !args.open_editor {
-            if let Some(m) = args.message {
-                msg = m.to_string();
-            }
-            if let Some(a) = args.author {
-                if let Some(caps) = re.captures(a.trim()) {
-                    a_name = caps[1].trim().to_string();
-                    a_email = caps[2].trim().to_string();
-                } else {
-                    return Err(GiteditError::InvalidAuthor {
-                        input: a.to_string(),
-                    });
-                }
-            }
-            if let Some(an) = args.author_name {
-                a_name = an.to_string();
-            }
-            if let Some(ae) = args.author_email {
-                a_email = ae.to_string();
-            }
-            if let Some(d) = args.date {
-                let parsed = parse_date(d, Some(dt))?;
-                date_raw = parsed.format("%Y-%m-%d %H:%M:%S %:z").to_string();
-            }
-        }
-
-        let is_head = oid == head_oid;
-        let branch_decorations = if is_head {
-            format!("(HEAD -> {})", ctx.branch_name)
-        } else {
-            String::new()
-        };
-
-        entries.push(ManifestEntry {
-            action: CommitAction::Commit,
-            original_oid: oid,
-            short_sha,
-            author_name: a_name,
-            author_email: a_email,
-            date_raw,
-            message: msg,
-            is_head,
-            branch_decorations,
-        });
+/// Apply non-interactive CLI flags (message, author, date) to the target commit's manifest entry.
+fn apply_cli_edit_overrides(
+    entry: &mut ManifestEntry,
+    args: &EditArgs,
+    commit: &Commit,
+) -> Result<(), GiteditError> {
+    if let Some(m) = args.message {
+        entry.message = m.to_string();
     }
+
+    if let Some(a) = args.author {
+        let (name, email) = parse_author_spec(a)?;
+        entry.author_name = name;
+        entry.author_email = email;
+    }
+
+    if let Some(an) = args.author_name {
+        entry.author_name = an.to_string();
+    }
+
+    if let Some(ae) = args.author_email {
+        entry.author_email = ae.to_string();
+    }
+
+    if let Some(d) = args.date {
+        let t = commit.time();
+        let offset = FixedOffset::east_opt(t.offset_minutes() * 60)
+            .unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
+        let dt = chrono::DateTime::from_timestamp(t.seconds(), 0)
+            .map(|d| d.with_timezone(&offset));
+
+        let parsed = parse_date(d, dt)?;
+        entry.date_raw = parsed.format("%Y-%m-%d %H:%M:%S %:z").to_string();
+    }
+
+    Ok(())
+}
+
+/// Build entries for all commits between HEAD and target, applying CLI overrides if not opening editor.
+fn build_edit_entries(
+    relevant_commits: &[Commit],
+    target_oid: Oid,
+    args: &EditArgs,
+    head_oid: Oid,
+    branch_name: &str,
+) -> Result<Vec<ManifestEntry>, GiteditError> {
+    let mut entries = Vec::with_capacity(relevant_commits.len());
+
+    for c in relevant_commits {
+        let mut entry = commit_to_entry(c, CommitAction::Commit, head_oid, branch_name);
+        if c.id() == target_oid && !args.open_editor {
+            apply_cli_edit_overrides(&mut entry, args, c)?;
+        }
+        entries.push(entry);
+    }
+
+    Ok(entries)
+}
+
+pub fn run(
+    cli: &Cli,
+    args: EditArgs,
+) -> Result<(), GiteditError> {
+    let ctx = RepoContext::open(".")?;
+    let relevant_commits = resolve_target_ancestry_chain(&ctx.repo, args.commit_spec, 1000)?;
+    let target_oid = relevant_commits.last().unwrap().id();
+
+    let entries = build_edit_entries(
+        &relevant_commits,
+        target_oid,
+        &args,
+        ctx.head_oid,
+        &ctx.branch_name,
+    )?;
 
     let final_entries = if args.open_editor {
         let manifest_text = format_manifest(&entries);

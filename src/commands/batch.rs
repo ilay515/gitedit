@@ -4,12 +4,133 @@ use crate::editor::{edit_manifest_with_retry, resolve_editor};
 use crate::errors::GiteditError;
 use crate::git::range::{format_short_sha, resolve_range};
 use crate::git::repo::RepoContext;
-use crate::git::rewrite::{execute_rewrite, RewritePlan};
-use crate::manifest::{format_manifest, has_manifest_changes};
+use crate::git::rewrite::{execute_rewrite, RewritePlan, RewriteResult};
 use crate::manifest::types::{CommitAction, ManifestEntry};
-use chrono::FixedOffset;
+use crate::manifest::{commit_to_entry, format_manifest, has_manifest_changes, parse_author_spec};
 use colored::Colorize;
 use regex::Regex;
+
+/// Parse optional positional range string (e.g. `HEAD~10..HEAD` or `HEAD~10`) or fallback to CLI flags.
+pub fn parse_range_boundaries(
+    range: Option<&str>,
+    cli_from: Option<&str>,
+    cli_to: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    if let Some(r) = range {
+        if let Some((f, t)) = r.split_once("..") {
+            (Some(f.to_string()), Some(t.to_string()))
+        } else {
+            (None, Some(r.to_string()))
+        }
+    } else {
+        (cli_from.map(String::from), cli_to.map(String::from))
+    }
+}
+
+/// Apply author matching regex filter and replace matching authors using nom-parsed author spec.
+pub fn apply_author_updates(
+    entries: &mut [ManifestEntry],
+    match_author: Option<&str>,
+    new_author: Option<&str>,
+) -> Result<(), GiteditError> {
+    let Some(new_auth) = new_author else {
+        return Ok(());
+    };
+
+    let (parsed_name, parsed_email) = parse_author_spec(new_auth)?;
+
+    if let Some(author_pat) = match_author {
+        let re = Regex::new(author_pat)
+            .map_err(|e| GiteditError::Other(format!("Invalid regex: {}", e)))?;
+        for entry in entries.iter_mut() {
+            if re.is_match(&entry.author_name) || re.is_match(&entry.author_email) {
+                entry.author_name = parsed_name.clone();
+                entry.author_email = parsed_email.clone();
+            }
+        }
+    } else {
+        for entry in entries.iter_mut() {
+            entry.author_name = parsed_name.clone();
+            entry.author_email = parsed_email.clone();
+        }
+    }
+
+    Ok(())
+}
+
+/// Apply relative date shifts or fixed date overrides across all manifest entries.
+pub fn apply_date_adjustments(
+    entries: &mut [ManifestEntry],
+    shift_dates: Option<&str>,
+    set_date: Option<&str>,
+) -> Result<(), GiteditError> {
+    if let Some(shift) = shift_dates {
+        for entry in entries.iter_mut() {
+            let parsed = parse_date(shift, None)?;
+            entry.date_raw = parsed.format("%Y-%m-%d %H:%M:%S %:z").to_string();
+        }
+    }
+
+    if let Some(fixed_date) = set_date {
+        let parsed = parse_date(fixed_date, None)?;
+        for entry in entries.iter_mut() {
+            entry.date_raw = parsed.format("%Y-%m-%d %H:%M:%S %:z").to_string();
+        }
+    }
+
+    Ok(())
+}
+
+/// Open editor or accept programmatic entries if `no_editor` is specified.
+fn resolve_manifest_entries(
+    ctx: &RepoContext,
+    cli: &Cli,
+    entries: Vec<ManifestEntry>,
+    no_editor: bool,
+) -> Result<Vec<ManifestEntry>, GiteditError> {
+    if no_editor {
+        Ok(entries)
+    } else {
+        let manifest_text = format_manifest(&entries);
+        let editor_cmd = resolve_editor(cli.editor.as_deref());
+        println!("Opening editor '{}'...", editor_cmd.cyan());
+        edit_manifest_with_retry(ctx.repo.path(), &manifest_text, &editor_cmd)
+    }
+}
+
+/// Print formatted execution results to standard output.
+fn print_rewrite_summary(result: &RewriteResult, dry_run: bool, verbose: bool) {
+    if dry_run {
+        println!(
+            "{}",
+            format!(
+                "✓ Dry run complete. {} commit(s) would be rewritten, {} squashed, {} dropped.",
+                result.commits_rewritten, result.commits_squashed, result.commits_dropped
+            )
+            .green()
+        );
+        return;
+    }
+
+    println!("\n{}", "✓ Git history successfully updated!".green().bold());
+    println!(
+        "Rewritten: {}, Squashed: {}, Dropped: {}",
+        result.commits_rewritten.to_string().cyan(),
+        result.commits_squashed.to_string().yellow(),
+        result.commits_dropped.to_string().red()
+    );
+    if let Some(ref b_ref) = result.backup_ref {
+        println!("Backup saved: {}", b_ref.cyan());
+        println!("Run '{}' to rollback at any time.", "gitedit undo".bold());
+    }
+
+    if verbose {
+        println!("\n{}", "Commit Hash Mapping:".bold());
+        for (old_sha, new_sha) in &result.remap {
+            println!("  {} -> {}", format_short_sha(*old_sha), format_short_sha(*new_sha));
+        }
+    }
+}
 
 pub fn run(
     cli: &Cli,
@@ -29,16 +150,7 @@ pub fn run(
         );
     }
 
-    // Parse range if given (e.g. HEAD~10..HEAD)
-    let (from_spec, to_spec) = if let Some(r) = range {
-        if let Some((f, t)) = r.split_once("..") {
-            (Some(f.to_string()), Some(t.to_string()))
-        } else {
-            (None, Some(r.to_string()))
-        }
-    } else {
-        (cli.from.clone(), cli.to.clone())
-    };
+    let (from_spec, to_spec) = parse_range_boundaries(range, cli.from.as_deref(), cli.to.as_deref());
 
     let commits = resolve_range(
         &ctx.repo,
@@ -53,100 +165,17 @@ pub fn run(
         ctx.branch_name.green().bold()
     );
 
-    // Convert commits to initial ManifestEntry items
-    let mut entries = Vec::new();
-    let head_oid = ctx.head_oid;
-
-    for c in &commits {
-        let oid = c.id();
-        let short_sha = format_short_sha(oid);
-        let author = c.author();
-        let author_name = author.name().unwrap_or("").to_string();
-        let author_email = author.email().unwrap_or("").to_string();
-
-        let t = c.time();
-        let offset = FixedOffset::east_opt(t.offset_minutes() * 60).unwrap_or(FixedOffset::east_opt(0).unwrap());
-        let dt = chrono::DateTime::from_timestamp(t.seconds(), 0)
-            .map(|d| d.with_timezone(&offset))
-            .unwrap_or_default();
-        let date_raw = dt.format("%Y-%m-%d %H:%M:%S %:z").to_string();
-
-        let message = c.message().unwrap_or("").to_string();
-        let is_head = oid == head_oid;
-        let branch_decorations = if is_head {
-            format!("(HEAD -> {})", ctx.branch_name)
-        } else {
-            String::new()
-        };
-
-        entries.push(ManifestEntry {
-            action: CommitAction::Commit,
-            original_oid: oid,
-            short_sha,
-            author_name,
-            author_email,
-            date_raw,
-            message,
-            is_head,
-            branch_decorations,
-        });
-    }
-
-    let parse_re = Regex::new(r"^(.*?)\s*<([^>]+)>$").unwrap();
+    // Convert commits to initial ManifestEntry items using shared helper
+    let mut entries: Vec<ManifestEntry> = commits
+        .iter()
+        .map(|c| commit_to_entry(c, CommitAction::Commit, ctx.head_oid, &ctx.branch_name))
+        .collect();
 
     // Apply CLI flags if specified
-    if let Some(author_pat) = match_author {
-        let re = Regex::new(author_pat).map_err(|e| GiteditError::Other(format!("Invalid regex: {}", e)))?;
-        for entry in &mut entries {
-            if re.is_match(&entry.author_name) || re.is_match(&entry.author_email) {
-                if let Some(new_auth) = new_author {
-                    if let Some(caps) = parse_re.captures(new_auth.trim()) {
-                        entry.author_name = caps[1].trim().to_string();
-                        entry.author_email = caps[2].trim().to_string();
-                    } else {
-                        return Err(GiteditError::InvalidAuthor {
-                            input: new_auth.to_string(),
-                        });
-                    }
-                }
-            }
-        }
-    } else if let Some(new_auth) = new_author {
-        if let Some(caps) = parse_re.captures(new_auth.trim()) {
-            for entry in &mut entries {
-                entry.author_name = caps[1].trim().to_string();
-                entry.author_email = caps[2].trim().to_string();
-            }
-        } else {
-            return Err(GiteditError::InvalidAuthor {
-                input: new_auth.to_string(),
-            });
-        }
-    }
+    apply_author_updates(&mut entries, match_author, new_author)?;
+    apply_date_adjustments(&mut entries, shift_dates, set_date)?;
 
-    if let Some(shift) = shift_dates {
-        for entry in &mut entries {
-            let parsed = parse_date(shift, None)?;
-            entry.date_raw = parsed.format("%Y-%m-%d %H:%M:%S %:z").to_string();
-        }
-    }
-
-    if let Some(fixed_date) = set_date {
-        let parsed = parse_date(fixed_date, None)?;
-        for entry in &mut entries {
-            entry.date_raw = parsed.format("%Y-%m-%d %H:%M:%S %:z").to_string();
-        }
-    }
-
-    // Open editor unless no_editor is set
-    let final_entries = if no_editor {
-        entries
-    } else {
-        let manifest_text = format_manifest(&entries);
-        let editor_cmd = resolve_editor(cli.editor.as_deref());
-        println!("Opening editor '{}'...", editor_cmd.cyan());
-        edit_manifest_with_retry(ctx.repo.path(), &manifest_text, &editor_cmd)?
-    };
+    let final_entries = resolve_manifest_entries(&ctx, cli, entries, no_editor)?;
 
     if !has_manifest_changes(&final_entries, &commits) {
         println!("{}", "No changes made to manifest. Nothing to do.".yellow());
@@ -163,37 +192,7 @@ pub fn run(
     }
 
     let result = execute_rewrite(&ctx.repo, &ctx.branch_name, &plan)?;
-
-    if cli.dry_run {
-        println!(
-            "{}",
-            format!(
-                "✓ Dry run complete. {} commit(s) would be rewritten, {} squashed, {} dropped.",
-                result.commits_rewritten, result.commits_squashed, result.commits_dropped
-            )
-            .green()
-        );
-        return Ok(());
-    }
-
-    println!("\n{}", "✓ Git history successfully updated!".green().bold());
-    println!(
-        "Rewritten: {}, Squashed: {}, Dropped: {}",
-        result.commits_rewritten.to_string().cyan(),
-        result.commits_squashed.to_string().yellow(),
-        result.commits_dropped.to_string().red()
-    );
-    if let Some(b_ref) = result.backup_ref {
-        println!("Backup saved: {}", b_ref.cyan());
-        println!("Run '{}' to rollback at any time.", "gitedit undo".bold());
-    }
-
-    if cli.verbose {
-        println!("\n{}", "Commit Hash Mapping:".bold());
-        for (old_sha, new_sha) in result.remap {
-            println!("  {} -> {}", format_short_sha(old_sha), format_short_sha(new_sha));
-        }
-    }
+    print_rewrite_summary(&result, cli.dry_run, cli.verbose);
 
     Ok(())
 }

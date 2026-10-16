@@ -1,21 +1,19 @@
 use crate::cli::Cli;
 use crate::errors::GiteditError;
-use crate::git::range::{format_short_sha, resolve_range};
+use crate::git::range::resolve_range;
 use crate::git::repo::RepoContext;
 use crate::git::rewrite::{execute_rewrite, RewritePlan};
+use crate::manifest::commit_to_entry;
 use crate::manifest::types::{CommitAction, ManifestEntry};
-use chrono::FixedOffset;
 use colored::Colorize;
+use git2::{Commit, Oid, Repository};
 
-pub fn run(
-    cli: &Cli,
-    range: Option<&str>,
+/// Determine how many commits to squash based on CLI arguments or range notation.
+pub fn determine_squash_count(
+    repo: &Repository,
     count: Option<usize>,
-    custom_message: Option<&str>,
-    fixup: bool,
-) -> Result<(), GiteditError> {
-    let ctx = RepoContext::open(".")?;
-
+    range: Option<&str>,
+) -> Result<usize, GiteditError> {
     let num_to_squash = match (count, range) {
         (Some(c), _) => c,
         (None, Some(r)) => {
@@ -24,7 +22,7 @@ pub fn run(
             } else {
                 (None, Some(r))
             };
-            let commits = resolve_range(&ctx.repo, f, t, 1000)?;
+            let commits = resolve_range(repo, f, t, 1000)?;
             commits.len()
         }
         (None, None) => 2, // default squash last 2 commits
@@ -34,37 +32,21 @@ pub fn run(
         return Err(GiteditError::Other("Must squash at least 2 commits".into()));
     }
 
-    let commits = resolve_range(&ctx.repo, None, None, num_to_squash)?;
-    if commits.len() < num_to_squash {
-        return Err(GiteditError::Other(format!(
-            "Not enough commits in history to squash {} (found {})",
-            num_to_squash,
-            commits.len()
-        )));
-    }
+    Ok(num_to_squash)
+}
 
-    let mut entries = Vec::new();
-    let head_oid = ctx.head_oid;
+/// Build manifest entries configured for squashing `num_to_squash` recent commits into the base commit.
+pub fn build_squash_entries(
+    commits: &[Commit],
+    num_to_squash: usize,
+    fixup: bool,
+    custom_message: Option<&str>,
+    head_oid: Oid,
+    branch_name: &str,
+) -> Vec<ManifestEntry> {
+    let mut entries = Vec::with_capacity(commits.len());
 
     for (idx, c) in commits.iter().enumerate() {
-        let oid = c.id();
-        let short_sha = format_short_sha(oid);
-        let author = c.author();
-        let author_name = author.name().unwrap_or("").to_string();
-        let author_email = author.email().unwrap_or("").to_string();
-
-        let t = c.time();
-        let offset = FixedOffset::east_opt(t.offset_minutes() * 60).unwrap_or(FixedOffset::east_opt(0).unwrap());
-        let dt = chrono::DateTime::from_timestamp(t.seconds(), 0)
-            .map(|d| d.with_timezone(&offset))
-            .unwrap_or_default();
-        let date_raw = dt.format("%Y-%m-%d %H:%M:%S %:z").to_string();
-
-        let msg = c.message().unwrap_or("").to_string();
-
-        // In git log order:
-        // index 0..n-2 are newer commits, they are marked Squash/Fixup
-        // index n-1 is the oldest base commit, it is marked Commit
         let action = if idx < num_to_squash - 1 {
             if fixup {
                 CommitAction::Fixup
@@ -75,32 +57,45 @@ pub fn run(
             CommitAction::Commit
         };
 
-        let is_head = oid == head_oid;
-        let branch_decorations = if is_head {
-            format!("(HEAD -> {})", ctx.branch_name)
-        } else {
-            String::new()
-        };
-
-        entries.push(ManifestEntry {
-            action,
-            original_oid: oid,
-            short_sha,
-            author_name,
-            author_email,
-            date_raw,
-            message: msg,
-            is_head,
-            branch_decorations,
-        });
+        entries.push(commit_to_entry(c, action, head_oid, branch_name));
     }
 
     if let Some(msg) = custom_message {
-        // Set message on the base commit (last entry)
         if let Some(base) = entries.last_mut() {
             base.message = msg.to_string();
         }
     }
+
+    entries
+}
+
+pub fn run(
+    cli: &Cli,
+    range: Option<&str>,
+    count: Option<usize>,
+    custom_message: Option<&str>,
+    fixup: bool,
+) -> Result<(), GiteditError> {
+    let ctx = RepoContext::open(".")?;
+    let num_to_squash = determine_squash_count(&ctx.repo, count, range)?;
+
+    let commits = resolve_range(&ctx.repo, None, None, num_to_squash)?;
+    if commits.len() < num_to_squash {
+        return Err(GiteditError::Other(format!(
+            "Not enough commits in history to squash {} (found {})",
+            num_to_squash,
+            commits.len()
+        )));
+    }
+
+    let entries = build_squash_entries(
+        &commits,
+        num_to_squash,
+        fixup,
+        custom_message,
+        ctx.head_oid,
+        &ctx.branch_name,
+    );
 
     let plan = RewritePlan {
         entries,
