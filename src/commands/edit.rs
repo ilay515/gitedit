@@ -5,7 +5,7 @@ use crate::errors::GiteditError;
 use crate::git::range::{format_short_sha, resolve_range};
 use crate::git::repo::RepoContext;
 use crate::git::rewrite::{execute_rewrite, RewritePlan};
-use crate::manifest::format_manifest;
+use crate::manifest::{format_manifest, has_manifest_changes};
 use crate::manifest::types::{CommitAction, ManifestEntry};
 use chrono::FixedOffset;
 use colored::Colorize;
@@ -26,7 +26,6 @@ pub fn run(
     args: EditArgs,
 ) -> Result<(), GiteditError> {
     let ctx = RepoContext::open(".")?;
-    ctx.check_dirty(cli.force)?;
 
     let target_commit = ctx.repo.revparse_single(args.commit_spec)?.peel_to_commit()?;
     let target_oid = target_commit.id();
@@ -126,6 +125,11 @@ pub fn run(
     } else {
         entries
     };
+
+    if !has_manifest_changes(&final_entries, &relevant_commits) {
+        println!("{}", "No changes made. Nothing to do.".yellow());
+        return Ok(());
+    }
 
     let plan = RewritePlan {
         entries: final_entries,

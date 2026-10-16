@@ -114,3 +114,46 @@ fn test_roundtrip_through_manifest_format_and_parse() {
     let result = execute_rewrite(&repo, "master", &plan).unwrap();
     assert_eq!(result.commits_rewritten, 2);
 }
+
+#[test]
+fn test_no_changes_detected_on_identical_manifest() {
+    use gitedit::manifest::has_manifest_changes;
+
+    let (_dir, repo) = create_test_repo(2);
+    let commits = resolve_range(&repo, None, None, 10).unwrap();
+
+    let mut entries = Vec::new();
+    for c in &commits {
+        let t = c.time();
+        let offset = chrono::FixedOffset::east_opt(t.offset_minutes() * 60).unwrap();
+        let dt = chrono::DateTime::from_timestamp(t.seconds(), 0).unwrap().with_timezone(&offset);
+
+        entries.push(ManifestEntry {
+            action: CommitAction::Commit,
+            original_oid: c.id(),
+            short_sha: c.id().to_string()[..7].to_string(),
+            author_name: c.author().name().unwrap().to_string(),
+            author_email: c.author().email().unwrap().to_string(),
+            date_raw: dt.format("%Y-%m-%d %H:%M:%S %:z").to_string(),
+            message: c.message().unwrap().to_string(),
+            is_head: false,
+            branch_decorations: String::new(),
+        });
+    }
+
+    // Format then parse (simulating user opening editor and immediately saving without changes)
+    let formatted = format_manifest(&entries);
+    let parsed = parse_manifest(&formatted).unwrap();
+
+    assert!(!has_manifest_changes(&parsed, &commits));
+
+    // Now modify one character in author name
+    let mut modified = parsed.clone();
+    modified[0].author_name.push('!');
+    assert!(has_manifest_changes(&modified, &commits));
+
+    // Or modify action to Squash
+    let mut modified_action = parsed.clone();
+    modified_action[0].action = CommitAction::Squash;
+    assert!(has_manifest_changes(&modified_action, &commits));
+}

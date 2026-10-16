@@ -15,7 +15,6 @@ pub fn run(
     fixup: bool,
 ) -> Result<(), GiteditError> {
     let ctx = RepoContext::open(".")?;
-    ctx.check_dirty(cli.force)?;
 
     let num_to_squash = match (count, range) {
         (Some(c), _) => c,

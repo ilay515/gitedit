@@ -30,7 +30,7 @@ pub struct Cli {
     #[arg(short = 'd', long, global = true)]
     pub dry_run: bool,
 
-    /// Force execution even if working directory has uncommitted changes
+    /// Bypass checks (kept for backward compatibility; working tree is never modified)
     #[arg(short = 'f', long, global = true)]
     pub force: bool,
 

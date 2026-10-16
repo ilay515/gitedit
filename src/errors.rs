@@ -2,9 +2,6 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum GiteditError {
-    #[error("Repository has uncommitted changes. Use --force to bypass.")]
-    DirtyWorkingTree,
-
     #[error("No commits found in the specified range")]
     EmptyRange,
 

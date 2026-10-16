@@ -1,5 +1,5 @@
 use crate::errors::GiteditError;
-use git2::{BranchType, Repository, StatusOptions};
+use git2::{BranchType, Repository};
 use std::path::Path;
 
 pub struct RepoContext {
@@ -33,23 +33,6 @@ impl RepoContext {
             branch_name,
             head_oid,
         })
-    }
-
-    pub fn check_dirty(&self, force: bool) -> Result<(), GiteditError> {
-        if force {
-            return Ok(());
-        }
-
-        let mut opts = StatusOptions::new();
-        opts.include_untracked(false);
-        opts.include_ignored(false);
-
-        let statuses = self.repo.statuses(Some(&mut opts))?;
-        if !statuses.is_empty() {
-            return Err(GiteditError::DirtyWorkingTree);
-        }
-
-        Ok(())
     }
 
     pub fn has_upstream(&self) -> bool {
