@@ -10,6 +10,10 @@ A fast, safe, and intuitive Rust CLI for rewriting Git history. Modify commit me
 - **Intuitive & Specific Date Engine**: Supports ISO 8601 (`2026-10-16 14:30:00 +03:00`), Unix epochs (`@1760613600`), relative shifts (`+2h`, `-1d`), and natural phrases (`"yesterday 15:00"`).
 - **Safety First & Instant Rollback**: Creates automatic backup refs (`refs/gitedit/backups/...`) and supports one-command `gitedit undo`.
 
+## Example
+
+![Example](example.png)
+
 ## Installation
 
 ```bash
