@@ -1,0 +1,18 @@
+[package]
+name = "gitedit"
+version = "0.1.0"
+edition = "2021"
+description = "Fast, safe Git history manipulation CLI"
+
+[dependencies]
+git2 = "0.21"
+clap = { version = "4.6", features = ["derive", "env"] }
+chrono = { version = "0.4", features = ["serde"] }
+interim = { version = "0.1", features = ["chrono"] }
+regex = "1.10"
+colored = "2.1"
+anyhow = "1.0"
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3.10"
